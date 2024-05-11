@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """Run linear probe experiment to evaluate self-supervised feature quality.
 
 Example:
@@ -26,8 +27,16 @@ import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.datasets as datasets
+from torch.utils.data.dataset import Dataset
 import torchvision.models as models
 import torchvision.transforms as transforms
+from torch.utils import data
+from PIL import Image
+import pandas as pd
+import os
+from scipy.io import loadmat
+from torch.utils.data import DataLoader
+import cv2
 
 import hybrid_resnet
 import moco.builder
@@ -41,6 +50,7 @@ import itertools
 from yaspi.yaspi import Yaspi
 
 os.environ['KMP_WARNINGS'] = '0'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -52,15 +62,15 @@ parser.add_argument('-d', '--datadir', metavar='DIR', default="data", type=Path,
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
                     help=f'model arch: {"|".join(model_names)} (default: resnet50)')
-parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
-parser.add_argument('--epochs', default=10, type=int, metavar='N',
+parser.add_argument('--epochs', default=30, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('--classes', default=10, type=int,
+parser.add_argument('--classes', default=600, type=int,
                     help='Number of classes in the training set (default:10)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=64, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -135,8 +145,41 @@ parser.add_argument("--exp_config", default="yaspi_probe.json", type=Path)
 
 best_acc1 = 0
 acc1_list = []
-args = parser.parse_args(args=['--gpu', '0', '--pretrained', 'model/selfsup/simclr/SimCLR-resnet18-quantum_False-classes_10-netwidth_8-nlayers_2-identity_False-epochsize_50000-bsize_128-tepochs_200_0/checkpoint_0000.path.tar', '-a', 'resnet18']) # for jupyter notebook
+train_loss_list = []
+train_acc_list = []
+test_loss_list = []
+args = parser.parse_args(args=['--gpu', '0', '--pretrained', 'model/selfsup/simclr/SimCLR-resnet18-quantum_False-classes_600-netwidth_8-nlayers_2-identity_False-epochsize_4800-bsize_32-tepochs_30_0/checkpoint_0029.path.tar', '-a', 'resnet18']) # for jupyter notebook
+#args = parser.parse_args()
 
+# +
+# 2023-3-12 custom dataset created by Allen LIN
+
+class fingerprintDataset(Dataset):
+    def __init__(self, annotations_file, img_dir, transform=None, target_transform=None):
+        self.img_labels = pd.read_csv(annotations_file)
+        self.img_dir = img_dir
+        self.transform = transform
+        self.targets = self.img_labels.iloc[:, 1] # label of the dataset
+        self.target_transform = target_transform
+        img_path = os.path.join(self.img_dir, self.img_labels.iloc[0, 0])
+        image = cv2.imread(img_path)
+        self.data = np.empty((len(self.img_labels), *image.shape), dtype=np.uint8)
+        for i in range(len(self.img_labels)):
+            self.data[i] = image
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.img_labels.iloc[idx, 0])
+        image = cv2.imread(img_path)
+        label = self.img_labels.iloc[idx, 1]
+        if self.transform:
+            image = self.transform(image)
+        if self.target_transform:
+            label = self.target_transform(label)
+        return image, label
+    def __len__(self):
+        return len(self.img_labels)
+
+
+# -
 
 def main():
     #args = parser.parse_args() for command line
@@ -337,16 +380,18 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     cudnn.benchmark = True
+    
+    training_annotations_file = os.path.join("..", "kaggle_fingerprint", "kaggle_training_fingerprint_annotations.csv")
+    validation_annotations_file = os.path.join("..", "kaggle_fingerprint", "kaggle_validation_fingerprint_annotations.csv")
+    img_dir = os.path.join("..", "kaggle_fingerprint", "SOCOFing", "All")
 
-    # Data loading code
-    # normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-    #                                 std=[0.229, 0.224, 0.225])
-
-    # For CIFAR
-    normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-                                     std=[0.2023, 0.1994, 0.2010])
+     # Normalization for SOCOFing Fingerprint dataset
+    normalize = transforms.Normalize(mean=[0.5071, 0.5071, 0.5071],
+                                     std=[0.4107, 0.4107, 0.4107])
 
     augmentation = [
+        transforms.ToPILImage(), # to PIL format
+        transforms.Resize((90, 90)),
         transforms.RandomResizedCrop(32),
         transforms.RandomApply([
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
@@ -359,22 +404,42 @@ def main_worker(gpu, ngpus_per_node, args):
     ]
 
     num_classes = args.classes
+    
+    train_dataset = fingerprintDataset(training_annotations_file, img_dir, transform=transforms.Compose(augmentation))
+    val_dataset = fingerprintDataset(validation_annotations_file, img_dir,
+                                     transform=transforms.Compose([
+                                       transforms.ToPILImage(), # to PIL format
+                                       transforms.Resize((90, 90)),
+                                       transforms.ToTensor(),
+                                       normalize,
+                                    ]))
+    
+#     # Before split dataset
+#     print("Before split")
+#     print('Train data set:', len(train_dataset))
+#     print('Test data set:', len(val_dataset))
 
-    train_dataset = datasets.CIFAR10(root=args.datadir, train=True, download=True,
-                                     transform=transforms.Compose(augmentation))
+#     # Random split
+#     train_set_size = int(len(train_dataset) * 0.8)
+#     valid_set_size = len(train_dataset) - train_set_size
+#     train_dataset, val_dataset = data.random_split(train_dataset, [train_set_size, valid_set_size])
 
+#     # After split (to sperate training and validation)
+#     print('='*30)
+#     print("After split")
+#     print('Train data set:', len(train_dataset))
+#     print('Valid data set:', len(val_dataset))
+
+#     # training
 #     train_labels = np.array(train_dataset.targets)
 #     train_idx = np.array(
 #         [np.where(train_labels == i)[0] for i in range(0, num_classes)]).flatten()
+#     print(f'train_idx.size: {train_idx.size}')
 #     train_dataset.targets = train_labels[train_idx]
 #     train_dataset.data = train_dataset.data[train_idx]
 
-    val_dataset = datasets.CIFAR10(root=args.datadir, train=False, download=True,
-                                   transform=transforms.Compose([
-                                       transforms.ToTensor(),
-                                       normalize,
-                                   ]))
-
+    
+#     # validation 
 #     val_labels = np.array(val_dataset.targets)
 #     val_idx = np.array(
 #         [np.where(val_labels == i)[0] for i in range(0, num_classes)]).flatten()
@@ -398,16 +463,20 @@ def main_worker(gpu, ngpus_per_node, args):
 
     model_path = create_output_model_path(args)
     print('Linear probing model saved at {}'.format(model_path))
-
+    
+    avg_loss, avg_acc = 0, 0
     for epoch in range(args.start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
-
+        avg_loss, avg_acc= train(train_loader, model, criterion, optimizer, epoch, args)
+        train_loss_list.append(avg_loss)
+        train_acc_list.append(avg_acc)
+        
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
-
+        avg_loss, acc1 = validate(val_loader, model, criterion, args)
+        test_loss_list.append(avg_loss)
+        
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
@@ -447,6 +516,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     no gradient), which are part of the model parameters too.
     """
     model.eval()
+    size = len(train_loader.dataset) # 資料總筆數
+    num_batches = len(train_loader) # 批次數量
+    total_loss, total_correct = 0, 0 # for calculate avg loss
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
@@ -459,19 +531,16 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         # compute output
         output = model(images)
-#         print(f'output.shape: {output.shape}')
-#         print(f'target.shape: {target.shape}')
-#         print(f'output: {output}')
-#         print(f'target: {target}')
-        print(f'target.min(): {target.min()}, target.max(): {target.max()}')
+        #print(f'target.min(): {target.min()}, target.max(): {target.max()}')
         loss = criterion(output, target)
-#         print(f'loss: {loss}')
+        total_loss += loss.item()
 
         # measure accuracy and record loss
         acc1, acc2 = accuracy(output, target, topk=(1, 2))
         losses.update(loss.item(), images.size(0))
         top1.update(acc1[0], images.size(0))
         top2.update(acc2[0], images.size(0))
+        total_correct += top1.val.item()
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -484,6 +553,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+    
+    return total_loss/num_batches, total_correct
 
 
 def validate(val_loader, model, criterion, args):
@@ -498,6 +569,8 @@ def validate(val_loader, model, criterion, args):
 
     # switch to evaluate mode
     model.eval()
+    num_batch = len(val_loader) # # 批次數量
+    total_loss = 0 # 定義平均 loss 用
 
     with torch.no_grad():
         end = time.time()
@@ -509,13 +582,14 @@ def validate(val_loader, model, criterion, args):
             # compute output
             output = model(images)
             loss = criterion(output, target)
+            total_loss += loss.item()
 
             # measure accuracy and record loss
             acc1, acc2 = accuracy(output, target, topk=(1, 2))
             losses.update(loss.item(), images.size(0))
             top1.update(acc1[0], images.size(0))
             top2.update(acc2[0], images.size(0))
-
+    
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
@@ -526,7 +600,7 @@ def validate(val_loader, model, criterion, args):
         print(' * Acc@1 {top1.avg:.3f} Acc@2 {top2.avg:.3f}'
               .format(top1=top1, top2=top2))
 
-    return top1.avg
+    return total_loss/num_batch, top1.avg
 
 
 def create_output_model_path(args, version=0):
@@ -651,3 +725,50 @@ def accuracy(output, target, topk=(1,)):
 
 if __name__ == '__main__':
     main()
+
+
+# +
+def print_loss(train_loss, test_loss):
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title("Linear Evaluation Loss")
+    plt.plot(train_loss,  label = "Training") # training loss curve
+    plt.plot(test_loss,  label = "Validation") # testing loss curve
+    plt.legend(loc = 'upper left')
+    fig = plt.gcf() # get current figure
+    plt.show()
+    return fig
+    
+def print_acc(train_acc, test_acc):
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy(%)')
+    plt.title("Top1 Accuracy")
+    plt.plot(train_acc,  label = "Training") # training acc curve
+    plt.plot(test_acc,  label = "Validation") # testing acc curve
+    plt.legend(loc = 'upper left')
+    fig = plt.gcf() # get current figure
+    plt.show()
+    return fig
+    
+def save_result_fig(args, name, version=0):
+    result_path = os.path.join('results', "Allen's Result", "SOCOFing_Fingerprint", "Linear Evaluation",
+                                  'epochsize_{}-bsize_{}-tepochs_{}_{}_{}_Fig.jpg'.format("55270", args.batch_size, args.epochs, name, version))
+    if os.path.exists(result_path):
+        return save_result_fig(args, name, version+1)
+    else:    
+        return result_path
+
+
+# +
+import matplotlib.pyplot as plt
+
+fig_loss = print_loss(train_loss_list, test_loss_list)
+fig_loss_path = save_result_fig(args, "Loss")
+fig_acc = print_acc(train_acc_list, acc1_list)
+fig_acc_path = save_result_fig(args, "Acc")
+ # 將訓練結果存起來
+fig_loss.savefig(fig_loss_path, bbox_inches='tight')
+fig_acc.savefig(fig_acc_path, bbox_inches='tight')
+# -
+
+

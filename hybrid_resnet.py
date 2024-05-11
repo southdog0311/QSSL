@@ -2,13 +2,12 @@ import sys
 
 from torchvision.models.resnet import Bottleneck, conv1x1, conv3x3
 
-sys.path.append("../quantum-neural-network/qnn")
+sys.path.append("./quantum-neural-network/qnn")
 
 import torch
 import torch.nn as nn
 import numpy as np
 
-from qnet import QNet
 
 __all__ = ['resnet18']
 
@@ -53,7 +52,7 @@ class BasicBlock(nn.Module):
 
 class ResNet(nn.Module):
 
-    def __init__(self, block, layers, args, num_classes=1000,
+    def __init__(self, block, layers, args, num_classes=600,
                  zero_init_residual=False, groups=1, width_per_group=64, replace_stride_with_dilation=None,
                  norm_layer=None, ):
         super(ResNet, self).__init__()
